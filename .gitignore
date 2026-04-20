@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+*.log
+test-cache/
+_realworld_test/
+_testdata/
+
+# Local Claude Code settings — user-specific, do not commit
+.claude/settings.local.json

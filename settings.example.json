@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/Claude-Code-Mapper/codemap_hook.py pre"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/Claude-Code-Mapper/codemap_hook.py post"
+          }
+        ]
+      }
+    ]
+  }
+}
