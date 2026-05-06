@@ -94,6 +94,16 @@ Add the following to `~/.claude/settings.json` (or merge with your existing `hoo
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/Users/xxx/Documents/GitHub/Claude-Code-Mapper/codemap_hook.py session"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Read",
