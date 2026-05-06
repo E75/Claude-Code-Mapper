@@ -12,13 +12,18 @@ for ~5 minutes. Across sessions — nothing.
 
 ## The approach
 
-Three hooks on the `Read` tool:
+Hooks on the `Read` tool plus a `SessionStart` injector:
 
-1. **PreToolUse**: if a cached map exists **and** the file hash is unchanged,
-   the hook blocks the real Read and hands Claude the cached map instead.
+1. **PreToolUse**: for files larger than `CODEMAP_MIN_LINES` (default 200), if a cached
+   map exists **and** the file hash is unchanged, the hook blocks the real Read and
+   hands Claude the cached map instead. Smaller files and partial reads pass through.
 2. **PostToolUse**: after a real Read succeeds, the file is parsed and the
    resulting code map is written to disk.
-3. The cache lives on disk, so maps survive restarts and are available the next day.
+3. **SessionStart**: at the start of each session, a compact project overview plus the
+   maps of the hottest cached files are injected into context (within a char budget).
+4. The cache lives on disk, so maps survive restarts and are available the next day.
+5. **Auto-pruning** keeps the index lean — files no longer on disk and cold entries
+   (60+ days unused, fewer than 5 reads) are removed periodically.
 
 ## Change detection
 
@@ -36,13 +41,16 @@ SHA-256 is the ground truth; `size`/`mtime` are only used as a cheap pre-filter.
 
 Tried in order, first success wins:
 
-1. **XAML parser** — built-in, for `.xaml`/`.axaml` (ctags doesn't parse these).
-   Captures `x:Class`, `x:Name`, `x:Key`, event handlers (`Clicked`, `Tapped`, …),
-   root element, and declared namespaces. Useful for .NET MAUI / WPF / Avalonia.
+1. **Built-in markup/style parsers** — for formats ctags doesn't handle well:
+   - **XAML** (`.xaml`/`.axaml`) — `x:Class`, `x:Name`, `x:Key`, event handlers
+     (`Clicked`, `Tapped`, …), root element, namespaces. .NET MAUI / WPF / Avalonia.
+   - **HTML** (`.html`/`.htm`) — `id`/`name` anchors, script/style blocks, links.
+   - **SCSS / Sass / CSS** — selectors, mixins, functions, `@import`/`@use`.
+   - **Razor** (`.razor`/`.cshtml`) — `@code` symbols, directives, component refs.
 2. **`universal-ctags`** (preferred for everything else) — JSON output, 40+ languages.
-3. **Regex fallback** — built-in lightweight sniffer for TS/JS/TSX (incl. class methods
-   and decorators), C# (methods, ctors, **records**, **properties**, events, delegates,
-   file-scoped namespaces), Python, Go, Java, Rust, Godot, and similar.
+3. **Regex fallback** — built-in lightweight sniffer for TS/JS/TSX (incl. Angular
+   decorators and class methods), C# (methods, ctors, **records**, **properties**,
+   events, delegates, file-scoped namespaces), Python, Go, Java, Rust, Godot, and similar.
 4. **Preview fallback** — if nothing matches, the first 80 lines are stored.
 
 ### Semantic enrichment (all sources)
@@ -149,11 +157,11 @@ Cached files: 0
     └── ...
 ```
 
-Each map file (schema v2, token-optimised — grouped by kind, short field aliases):
+Each map file (schema v3, token-optimised — grouped by kind, short field aliases):
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "path": "C:/project/src/auth/login.ts",
   "lang": "typescript",
   "src": "ctags",
@@ -214,6 +222,24 @@ wins compound from the second read onward, especially across sessions.
 The map also tells Claude the exact line numbers of every symbol, so when it does
 need the body of a specific method it can do `Read(file, offset=27, limit=20)`
 instead of loading the whole file.
+
+## Configuration
+
+All knobs are environment variables — set them globally or per-project.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEMAP_CACHE_DIR` | `~/.claude/codemap-cache` | Where maps and the index live. |
+| `CODEMAP_MIN_LINES` | `200` | Files larger than this get their `Read` intercepted. |
+| `CODEMAP_MIN_CACHE_LINES` | `80` | Files larger than this get cached on PostToolUse (even if not intercepted). |
+| `CODEMAP_MAX_SYMBOLS` | `100` | Cap on symbols per map. |
+| `CODEMAP_INCLUDE_TODOS` | `0` | Set to `1` to include TODO/FIXME/HACK markers. |
+| `CODEMAP_SESSION_FILES` | `20` | Hot files injected at SessionStart. |
+| `CODEMAP_SESSION_MAX_CHARS` | `20000` | Char budget for SessionStart injection. |
+| `CODEMAP_IGNORE_PATHS` | — | `;`-separated path substrings to always skip (case-insensitive). Example: `setx CODEMAP_IGNORE_PATHS "/legacy/;/generated/"`. |
+
+Built-in path ignores already cover `node_modules`, `.git`, `dist`, `bin`, `obj`,
+`.vs`, `packages`, `.angular`, and `coverage`.
 
 ## Limitations
 
