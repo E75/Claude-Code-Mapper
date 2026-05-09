@@ -2,17 +2,20 @@
 """Claude-Code-Mapper: hook-driven, cross-session code-map cache for Claude Code.
 
 Subcommands:
-    pre     Run as PreToolUse hook for the Read tool.
-    post    Run as PostToolUse hook for the Read tool.
-    status  Print cache summary.
-    clear   Delete the cache directory.
-    show    Print the cached code map for one path.
+    pre       Run as PreToolUse hook for the Read tool (block large reads, return codemap).
+    post      Run as PostToolUse hook for the Read tool (cache codemap of read file).
+    session   Run as SessionStart hook (inject project overview + hot-file codemaps).
+    status    Print cache summary (cached files, ctags availability).
+    clear     Delete the entire cache directory.
+    show      Print the cached code map for one path (JSON, indented).
+    refresh   Force-regenerate the code map for one path, bypassing cache.
 
 Cache layout (under CODEMAP_CACHE_DIR, default ~/.claude/codemap-cache):
-    index.json              -> { abs_path: { hash, size, mtime, map_file, generated_at } }
-    maps/<key>.json         -> code map for that file
+    index.json              -> { abs_path: { hash, size, mtime, map_file, generated_at, ... } }
+    maps/<key>.json         -> code map for that file (compact JSON)
     overviews/<hash>.md     -> project_overview.md for that project root
     overviews/<hash>.key    -> git-HEAD cache key for the overview
+    _last_cleanup           -> sidecar timestamp (cleanup runs at most 1×/24h)
 """
 from __future__ import annotations
 
@@ -37,11 +40,11 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 FALLBACK_PREVIEW_LINES = 40
 HASH_CHUNK = 65536
 
-# Minimum line threshold for code-mapping. Files with at most this many
-# lines are not cached: the map costs more tokens than it saves, and the
-# whole file fits in a single Read anyway. Override via CODEMAP_MIN_LINES.
-# Default: 200 — sweet spot where the codemap overhead (~300 framing tokens)
-# is more than recouped. Below ~80-120 lines, a direct Read is cheaper.
+# Minimum line threshold for code mapping. Files at or below this line count
+# are not cached: the map costs more tokens than it saves and the full file
+# fits in one Read anyway. Override via CODEMAP_MIN_LINES.
+# Default: 200 — sweet spot where the codemap overhead (~300 tokens framing)
+# is comfortably recouped. Below ~80-120 lines a direct Read pays off more.
 # CODEMAP_MIN_LINES  — intercept threshold: files LARGER than this get their Read
 #   blocked and replaced with the codemap. Smaller files are read normally.
 #   Default 200: a 200-line file costs ~2500 tokens; the codemap ~250. Worth it.
@@ -62,11 +65,13 @@ except ValueError:
     MIN_CACHE_LINES = 80
 
 # Max symbols in the output map. Prevents huge maps for large files.
-# Override via CODEMAP_MAX_SYMBOLS env var.
+# Override via CODEMAP_MAX_SYMBOLS env var. Bumped from 100 → 200 to cover
+# methode-zware classes (TableHelper.cs has 100+ methods). At 200 a typical
+# C# class still fits in ~6-8k JSON chars.
 try:
-    MAX_SYMBOLS = int(os.environ.get("CODEMAP_MAX_SYMBOLS", "100"))
+    MAX_SYMBOLS = int(os.environ.get("CODEMAP_MAX_SYMBOLS", "200"))
 except ValueError:
-    MAX_SYMBOLS = 100
+    MAX_SYMBOLS = 200
 
 # TODOs are opt-in — they're rarely relevant and add tokens.
 # Enable via CODEMAP_INCLUDE_TODOS=1.
@@ -88,9 +93,10 @@ except ValueError:
 # v3 = added html/scss/razor parsers, angular ts patterns, path ignores.
 CODEMAP_VERSION = 3
 
-# Path substrings (after normalising to forward-slashes + lowercase) that are
-# always skipped. Prevents the cache from filling up with vendored/build output
-# and translation files that have no code structure.
+# Path substrings (after normalization to forward-slashes + lowercase) that
+# are always skipped. Prevents the cache from filling up with vendored/build
+# output and translation files that have no code structure.
+# Keep in sync with _OVERVIEW_IGNORE (project-overview walk).
 DEFAULT_IGNORE_SUBSTRINGS = (
     "/node_modules/",
     "/.git/",
@@ -98,9 +104,25 @@ DEFAULT_IGNORE_SUBSTRINGS = (
     "/bin/",
     "/obj/",
     "/.vs/",
+    "/.vscode/",
+    "/.idea/",
     "/packages/",
     "/.angular/",
     "/coverage/",
+    "/.next/",
+    "/.nuxt/",
+    "/build/",
+    "/out/",
+    "/target/",
+    "/__pycache__/",
+    "/.pytest_cache/",
+    "/.mypy_cache/",
+    "/.gradle/",
+    "/.venv/",
+    "/venv/",
+    "/testresults/",
+    "/publish/",
+    "/letsgrow translations/locale/",
     "/webdevelopmentgit/pipelines/",
 )
 
@@ -201,12 +223,12 @@ def normalize_path(path: str) -> str:
 
 
 def _path_for_ignore_match(abs_path: str) -> str:
-    """Normalise to forward-slash + lowercase for substring-ignore matching."""
+    """Normalize to forward-slash + lowercase for substring-ignore matching."""
     return abs_path.replace("\\", "/").lower()
 
 
 def is_ignored(abs_path: str) -> bool:
-    """Check whether the path is skipped by defaults or CODEMAP_IGNORE_PATHS.
+    """Check whether the path is skipped via defaults or CODEMAP_IGNORE_PATHS.
 
     CODEMAP_IGNORE_PATHS = ';'-separated substrings, case-insensitive.
     Example: setx CODEMAP_IGNORE_PATHS "/legacy/;/generated/"
@@ -362,8 +384,8 @@ FALLBACK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"^\s*(?:(?:public|private|protected|internal)\s+)*"
         r"delegate\s+[\w<>\[\].?]+\s+(\w+)\s*\(([^)]*)\)"
     )),
-    # Angular @Input()/@Output() inline property decorators must come before
-    # ts_decorator, otherwise the generic decorator match swallows them.
+    # Angular @Input()/@Output() inline property decorators moeten vóór
+    # ts_decorator staan, anders slikt de generieke decorator-match ze op.
     ("ts_input", re.compile(
         r"^\s+@Input\s*\([^)]*\)\s+"
         r"(?:(?:public|private|protected|readonly|static|override)\s+)*"
@@ -374,7 +396,7 @@ FALLBACK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"(?:(?:public|private|protected|readonly|static|override)\s+)*"
         r"(\w+)"
     )),
-    # Modern Angular DI via inject(): `private foo = inject(Foo)` or typed
+    # Modern Angular DI via inject(): `private foo = inject(Foo)` of typed
     # variant `private foo: FooService = inject(FooService)`.
     ("ts_inject", re.compile(
         r"^\s+(?:public\s+|private\s+|protected\s+|readonly\s+)+\s*"
@@ -383,8 +405,8 @@ FALLBACK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # TS decorator (on its own line above a class/method)
     ("ts_decorator", re.compile(r"^\s*@([A-Z]\w*)\s*\(")),
     # TS/JS class method (indented, inside a class). Conservative: requires return-type or body brace.
-    # Negative lookahead filters out control-flow keywords that would otherwise be matched as a method
-    # (e.g. `if (x) {` inside a method body).
+    # Negatieve lookahead filtert control-flow keywords die anders als method worden gezien
+    # (bijv. `if (x) {` binnen een method-body).
     ("ts_method", re.compile(
         r"^\s{2,}(?:(?:public|private|protected|static|async|readonly|override|abstract)\s+)*"
         r"(?:async\s+)?"
@@ -504,7 +526,7 @@ def _truncate(text: str, limit: int = 280) -> str:
 
 
 def extract_imports(lines: list[str], ext: str) -> list[str]:
-    """Return up to 30 import targets from the top of the file."""
+    """Return up to 15 import targets from the top of the file (cap matches body)."""
     out: list[str] = []
     seen: set[str] = set()
     scan = lines[:300]  # imports cluster near the top
@@ -799,13 +821,13 @@ def build_codemap_xaml(abs_path: str, lines: list[str]) -> dict[str, Any]:
     return codemap
 
 
-# ---------- HTML (Angular templates and static HTML) ----------
+# ---------- HTML (Angular-templates en statische HTML) ----------
 
-# Custom components (kebab-case: prefix-name), plus common Angular/Material/CDK tags.
+# Custom components (kebab-case: prefix-name), plus gangbare Angular/Material/CDK tags.
 HTML_COMPONENT_RE = re.compile(
     r'<([a-z][a-z0-9]*(?:-[a-z0-9]+)+|ng-[a-z-]+|router-outlet|mat-[a-z-]+|cdk-[a-z-]+)\b'
 )
-# Event binding: (click)="handler(...)" — handler name + expression.
+# Event binding: (click)="handler(...)" — handler-naam + expressie.
 HTML_EVENT_RE = re.compile(r'\((\w+)\)\s*=\s*"([^"]{0,160})"')
 # Two-way: [(ngModel)]="prop"
 HTML_TWOWAY_RE = re.compile(r'\[\((\w+)\)\]\s*=\s*"([^"]{0,160})"')
@@ -874,7 +896,7 @@ SCSS_MEDIA_RE = re.compile(r'^\s*@media\b\s*(.+?)\s*\{')
 # Top-level selector on a single line: `html, body {`. Excludes @-rules.
 SCSS_TOP_SELECTOR_RE = re.compile(r'^([^\s@/].*?)\s*\{\s*$')
 # Top-level selector where `{` lives on the next line (CSS/SCSS style with
-# brace on a new line). Scans the whole file via re.MULTILINE.
+# block-on-new-line). Scans the full file via re.MULTILINE.
 SCSS_MULTILINE_SELECTOR_RE = re.compile(
     r'^([^\s@/][^\n{}]{0,200}?)\s*\n\s*\{',
     re.MULTILINE,
@@ -925,16 +947,16 @@ def build_codemap_scss(abs_path: str, lines: list[str]) -> dict[str, Any]:
                     seen_selectors.add(key)
                     symbols.append({"kind": "selector", "name": sel, "line": i})
 
-    # Second pass: top-level selectors where `{` sits on the next line
-    # (common CSS style in Map.css/Reset.css). Operates on the full content.
+    # Second pass: top-level selectors where `{` lives on the next line
+    # (common CSS style in Map.css/Reset.css). Operates on full content.
     content = "".join(lines)
     for m in SCSS_MULTILINE_SELECTOR_RE.finditer(content):
         sel = m.group(1).strip().lstrip("\ufeff")
         if not sel or len(sel) > 140:
             continue
-        # Skip if this happened to be a declaration (contains `:` without a pseudo signal).
-        # Real selectors: class/id/tag/pseudo-combinator. A `;` in the "selector" indicates
-        # a false hit (property list).
+        # Skip if this turned out to be a declaration (contains `:` without pseudo signal).
+        # Real selectors: class/id/tag/pseudo-combinator. A `;` in the "selector"
+        # indicates a wrong hit (property list).
         if ";" in sel:
             continue
         line_no = content.count("\n", 0, m.start()) + 1
@@ -1007,14 +1029,14 @@ def build_codemap_razor(abs_path: str, lines: list[str]) -> dict[str, Any]:
         for pm in RAZOR_PARTIAL_RE.finditer(raw):
             symbols.append({"kind": "partial", "name": pm.group(1), "line": i})
 
-    # Also run a fallback scan for C# blocks inside the cshtml (@{ ... } or @functions).
-    # ctags doesn't pick this up; we reuse the fallback regex on the whole file for
-    # any methods/classes declared in code blocks.
+    # Also add a fallback scan for C# blocks inside the cshtml (@{ ... } or @functions).
+    # ctags doesn't pick these up; we reuse the fallback regex on the full file
+    # for any declared methods/classes in code blocks.
     try:
         extra = build_codemap_fallback(abs_path, lines).get("symbols", [])
     except Exception:
         extra = []
-    # Filter so we don't double-count: skip kinds already collected above.
+    # Filter to avoid double-counting: skip kinds we already have above.
     existing = {(s["kind"], s.get("name")) for s in symbols}
     for s in extra:
         if (s["kind"], s.get("name")) not in existing:
@@ -1037,8 +1059,15 @@ def build_codemap_razor(abs_path: str, lines: list[str]) -> dict[str, Any]:
 def compact_codemap(cm: dict[str, Any]) -> dict[str, Any]:
     """Token-efficient transform: group symbols by kind, short-alias hot keys, tag version."""
     syms = cm.pop("symbols", [])
-    if len(syms) > MAX_SYMBOLS:
+    total_syms = len(syms)
+    if total_syms > MAX_SYMBOLS:
         syms = syms[:MAX_SYMBOLS]
+        # Surface truncation so Claude knows symbols beyond the cap exist and
+        # can refresh with a higher CODEMAP_MAX_SYMBOLS or use Grep to find
+        # symbols past the cut-off line.
+        cm["truncated"] = True
+        cm["total_symbols"] = total_syms
+        cm["shown_symbols"] = MAX_SYMBOLS
     grouped: dict[str, list[dict[str, Any]]] = {}
     for sym in syms:
         kind = sym.pop("kind", "unknown")
@@ -1342,7 +1371,7 @@ def run_index_cleanup(index: dict[str, Any]) -> bool:
     Pruning rules:
     - File no longer exists on disk.
     - File not accessed in 60+ days AND access_count < 5  (cold entries).
-    Also removes orphaned map files (maps/ entries not referenced in index).
+    - Orphaned map files in maps/ that no index entry references (any age).
     """
     cutoff = time.time() - 60 * 86400
     to_remove: list[str] = []
@@ -1355,27 +1384,49 @@ def run_index_cleanup(index: dict[str, Any]) -> bool:
         if last and last < cutoff and count < 5:
             to_remove.append(path)
 
-    if not to_remove:
-        return False
+    changed = False
 
-    live_map_files: set[str] = set()
-    for path in to_remove:
-        entry = index.pop(path)
-        mf = entry.get("map_file", "")
-        if mf:
-            # Only delete if no other entry references this map file.
-            live_map_files.add(mf)
+    if to_remove:
+        # Collect map files of entries we are about to remove. These are removed
+        # from the index here; we delete the corresponding maps/*.json below
+        # only if no remaining index entry still points to the same map file.
+        removed_map_files: set[str] = set()
+        for path in to_remove:
+            entry = index.pop(path)
+            mf = entry.get("map_file", "")
+            if mf:
+                removed_map_files.add(mf)
+        # Map files still referenced by any remaining entry must NOT be deleted
+        # (defensive — in practice each path → unique cache_key, no sharing).
+        still_referenced = {e.get("map_file", "") for e in index.values()}
+        for mf in removed_map_files - still_referenced:
+            mp = CACHE_DIR / mf
+            try:
+                if mp.exists():
+                    mp.unlink()
+            except OSError:
+                pass
+        changed = True
 
-    # Remove orphaned map files.
-    for mf in live_map_files:
-        mp = CACHE_DIR / mf
-        try:
-            if mp.exists():
-                mp.unlink()
-        except OSError:
-            pass
+    # Scan maps/ for orphan .json files that no index entry references.
+    # Catches files left behind by crashes, schema bumps, or manual edits.
+    try:
+        referenced = {e.get("map_file", "") for e in index.values()}
+        if MAPS_DIR.exists():
+            for mp in MAPS_DIR.iterdir():
+                if mp.suffix != ".json":
+                    continue
+                rel = f"maps/{mp.name}"
+                if rel not in referenced:
+                    try:
+                        mp.unlink()
+                        changed = True
+                    except OSError:
+                        pass
+    except OSError:
+        pass
 
-    return True
+    return changed
 
 
 # ---------- project overview ----------
@@ -1397,6 +1448,14 @@ _OVERVIEW_IGNORE: frozenset[str] = frozenset({
 _TECH_MARKERS: list[tuple[str, str]] = [
     ("angular.json",          "Angular"),
     ("nx.json",               "Angular / Nx"),
+    ("capacitor.config.ts",   "Capacitor"),
+    ("capacitor.config.json", "Capacitor"),
+    ("vite.config.ts",        "Vite"),
+    ("vite.config.js",        "Vite"),
+    ("next.config.js",        "Next.js"),
+    ("next.config.mjs",       "Next.js"),
+    ("svelte.config.js",      "SvelteKit"),
+    ("nuxt.config.ts",        "Nuxt"),
     (".csproj",               ".NET / C#"),
     (".sln",                  ".NET Solution"),
     (".vbproj",               ".NET / VB"),
@@ -1415,6 +1474,26 @@ _TECH_MARKERS: list[tuple[str, str]] = [
     (".cshtml",               "ASP.NET Razor"),
     ("package.json",          "Node.js"),
 ]
+
+
+def _detect_maui_in_csproj(root: Path) -> bool:
+    """Check top-level .csproj files for a MAUI TargetFramework (net*-android,
+    net*-ios, net*-maccatalyst, net*-windows). Avoids false-positive on plain .NET.
+    """
+    try:
+        for f in list(root.iterdir())[:20]:
+            if f.is_file() and f.suffix.lower() == ".csproj":
+                try:
+                    text = f.read_text(encoding="utf-8", errors="replace")[:4000]
+                except OSError:
+                    continue
+                if re.search(r"net\d+\.?\d*-(android|ios|maccatalyst|windows|tizen)", text, re.IGNORECASE):
+                    return True
+                if "<UseMaui>true</UseMaui>" in text or "Microsoft.Maui" in text:
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 def _overview_git_key(git_root: Path) -> str:
@@ -1460,6 +1539,12 @@ def _detect_tech_stack(root: Path) -> list[str]:
     # If Angular is found, remove bare Node.js label.
     if "Angular" in found or "Angular / Nx" in found:
         found.pop("Node.js", None)
+    # If Vite/Next/Nuxt/SvelteKit found, remove bare Node.js label too.
+    if any(k in found for k in ("Vite", "Next.js", "Nuxt", "SvelteKit")):
+        found.pop("Node.js", None)
+    # MAUI detection: if any csproj targets a mobile/desktop framework, surface as MAUI.
+    if ".NET / C#" in found and _detect_maui_in_csproj(root):
+        found[".NET MAUI"] = found[".NET / C#"] - 1  # show before plain .NET / C#
     return [label for label, _ in sorted(found.items(), key=lambda x: x[1])]
 
 
@@ -1604,20 +1689,8 @@ def generate_project_overview(scope_root: Path, git_root: Path) -> str:
         "```",
         tree,
         "```",
-        "",
-        f"## Code Files by Size",
-        "| File | Lines |",
-        "|------|------:|",
     ]
-    show_n = min(30, total_files)
-    for p, lc in code_files[:show_n]:
-        try:
-            rel = p.relative_to(scope_root)
-        except ValueError:
-            rel = p
-        parts.append(f"| `{rel}` | {lc:,} |")
-    if total_files > show_n:
-        parts.append(f"| _(+{total_files - show_n} smaller files)_ | |")
+
 
     ext_counts = Counter(p.suffix.lower() for p, _ in code_files)
     top_exts = ", ".join(f"{ext}({n})" for ext, n in ext_counts.most_common(6))
